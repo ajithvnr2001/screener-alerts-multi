@@ -109,21 +109,7 @@ class Default(WorkerEntrypoint):
         if "/api/screeners" in url and method == "GET":
             return self._json(await self._get_screeners())
 
-        if "/api/screeners" in url and method == "POST":
-            body = json.loads(str(await request.text()))
-            screeners = await self._get_screeners()
-            # Update existing or add new
-            found = False
-            for i, s in enumerate(screeners):
-                if s["id"] == body.get("id"):
-                    screeners[i].update(body)
-                    found = True
-                    break
-            if not found:
-                screeners.append(body)
-            await self.env.KV.put("screeners", json.dumps(screeners))
-            return self._json({"ok": True, "screeners": screeners})
-
+        # Specific routes FIRST (they also match "/api/screeners")
         if "/api/screeners/delete" in url and method == "POST":
             body = json.loads(str(await request.text()))
             del_id = body.get("id", "")
@@ -132,7 +118,6 @@ class Default(WorkerEntrypoint):
             await self.env.KV.put("screeners", json.dumps(screeners))
             return self._json({"ok": True, "screeners": screeners})
 
-        # ── API: Toggle a single screener ──
         if "/api/screeners/toggle" in url and method == "POST":
             body = json.loads(str(await request.text()))
             toggle_id = body.get("id", "")
@@ -141,6 +126,21 @@ class Default(WorkerEntrypoint):
                 if s["id"] == toggle_id:
                     s["enabled"] = not s.get("enabled", True)
                     break
+            await self.env.KV.put("screeners", json.dumps(screeners))
+            return self._json({"ok": True, "screeners": screeners})
+
+        # Generic add/update (must come AFTER specific sub-routes)
+        if "/api/screeners" in url and method == "POST":
+            body = json.loads(str(await request.text()))
+            screeners = await self._get_screeners()
+            found = False
+            for i, s in enumerate(screeners):
+                if s["id"] == body.get("id"):
+                    screeners[i].update(body)
+                    found = True
+                    break
+            if not found:
+                screeners.append(body)
             await self.env.KV.put("screeners", json.dumps(screeners))
             return self._json({"ok": True, "screeners": screeners})
 
