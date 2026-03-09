@@ -173,14 +173,13 @@ class Default(WorkerEntrypoint):
         from datetime import datetime, timezone, timedelta
         IST = timezone(timedelta(hours=5, minutes=30))
         now = datetime.now(IST)
+        now_epoch = int(now.timestamp())
 
-        # Interval gate — use Unix timestamp for reliable comparison
-        import time
-        interval = settings.get("interval_minutes", 1)
-        last_ts = settings.get("last_run_ts", 0)
-        now_ts = time.time()
-        if last_ts and interval > 1:
-            elapsed_min = (now_ts - last_ts) / 60
+        # Interval gate
+        interval = int(settings.get("interval_minutes", 1))
+        last_epoch = int(settings.get("last_run_epoch", 0))
+        if last_epoch and interval > 1:
+            elapsed_min = (now_epoch - last_epoch) / 60
             if elapsed_min < interval:
                 return
 
@@ -209,10 +208,12 @@ class Default(WorkerEntrypoint):
             if s.get("enabled", True):
                 await self._run_single(s)
 
-        settings["last_run"] = now.isoformat()
-        settings["last_run_ts"] = now_ts
-        settings["total_runs"] = settings.get("total_runs", 0) + 1
-        await self.env.KV.put("settings", json.dumps(settings))
+        # Re-read settings FRESH to avoid overwriting user changes
+        fresh = await self._get_settings()
+        fresh["last_run"] = now.isoformat()
+        fresh["last_run_epoch"] = now_epoch
+        fresh["total_runs"] = fresh.get("total_runs", 0) + 1
+        await self.env.KV.put("settings", json.dumps(fresh))
 
     # ─── Helpers ───
 
