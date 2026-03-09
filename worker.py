@@ -1,0 +1,679 @@
+from js import fetch, Headers
+from pyodide.ffi import to_js
+from workers import Response, WorkerEntrypoint
+import json
+
+# ─── Preconfigured screeners ───
+SCREENERS = [
+    {
+        "id": "goat1",
+        "name": "GOAT1 — Monthly Long Holdings",
+        "url": "https://www.screener.in/screens/3525076/goat1/",
+        "query": """Is not SME AND
+Market Capitalization > 200 AND
+Return on equity > 12 AND
+Return on capital employed > 12 AND
+Debt to equity < 1 AND
+Pledged percentage < 15 AND
+Cash from operations last year > 0 AND
+Sales growth 3Years > 8 AND
+Profit growth 3Years > 10 AND
+YOY Quarterly sales growth > 8 AND
+YOY Quarterly profit growth > 10 AND
+OPM > 10 AND
+OPM latest quarter > OPM preceding year quarter AND
+Piotroski score > 5 AND
+Price to Earning < Industry PE AND
+Promoter holding > 35 AND
+(Change in FII holding > 0 OR Change in DII holding > 0) AND
+Current price > DMA 50 AND
+Current price > DMA 200 AND
+RSI > 45 AND
+RSI < 78 AND
+MACD > MACD Signal AND
+Volume > Volume 1month average""",
+        "enabled": True,
+    },
+    {
+        "id": "opus-tele",
+        "name": "Opus-Tele — Momentum Screen",
+        "url": "https://www.screener.in/screens/3535927/opus-tele/",
+        "query": """Is not SME AND
+Return over 1month > 0 AND
+Return over 1week > 0 AND
+Return over 1day > 0 AND
+Return over 3months > 0 AND
+Current price > DMA 50 AND
+Current price > DMA 200 AND
+DMA 50 > DMA 200 AND
+DMA 50 > DMA 50 previous day AND
+DMA 200 > DMA 200 previous day AND
+RSI > 52 AND
+RSI < 68 AND
+MACD > MACD Signal AND
+MACD > 0 AND
+MACD > MACD Previous Day AND
+MACD Signal > MACD Signal Previous Day AND
+Volume > Volume 1month average AND
+Current price > High price * 0.85 AND
+Profit after tax > 0 AND
+Return on capital employed > 15 AND
+Return on equity > 12 AND
+Debt to equity < 1 AND
+Piotroski score > 5 AND
+Sales growth 3Years > 8 AND
+Profit growth 3Years > 5 AND
+Cash from operations last year > 0 AND
+Free cash flow last year > 0 AND
+Pledged percentage < 10 AND
+Promoter holding > 30 AND
+Quick ratio > 0.8 AND
+Price to Earning < 80 AND
+YOY Quarterly sales growth > 10 AND
+YOY Quarterly profit growth > 10""",
+        "enabled": True,
+    },
+]
+
+DEFAULT_SETTINGS = {
+    "enabled": True,
+    "interval_minutes": 1,
+    "start_time": "09:15",
+    "end_time": "15:30",
+    "start_date": "",
+    "end_date": "",
+    "last_run": "",
+    "total_runs": 0,
+}
+
+
+class Default(WorkerEntrypoint):
+
+    async def fetch(self, request):
+        url = str(request.url)
+        method = str(request.method)
+
+        # ── API: Global Settings ──
+        if "/api/settings" in url and method == "GET":
+            return self._json(await self._get_settings())
+
+        if "/api/settings" in url and method == "POST":
+            body = json.loads(str(await request.text()))
+            cur = await self._get_settings()
+            cur.update(body)
+            await self.env.KV.put("settings", json.dumps(cur))
+            return self._json({"ok": True, "settings": cur})
+
+        # ── API: Screener List ──
+        if "/api/screeners" in url and method == "GET":
+            return self._json(await self._get_screeners())
+
+        if "/api/screeners" in url and method == "POST":
+            body = json.loads(str(await request.text()))
+            screeners = await self._get_screeners()
+            # Update existing or add new
+            found = False
+            for i, s in enumerate(screeners):
+                if s["id"] == body.get("id"):
+                    screeners[i].update(body)
+                    found = True
+                    break
+            if not found:
+                screeners.append(body)
+            await self.env.KV.put("screeners", json.dumps(screeners))
+            return self._json({"ok": True, "screeners": screeners})
+
+        if "/api/screeners/delete" in url and method == "POST":
+            body = json.loads(str(await request.text()))
+            del_id = body.get("id", "")
+            screeners = await self._get_screeners()
+            screeners = [s for s in screeners if s["id"] != del_id]
+            await self.env.KV.put("screeners", json.dumps(screeners))
+            return self._json({"ok": True, "screeners": screeners})
+
+        # ── API: Toggle a single screener ──
+        if "/api/screeners/toggle" in url and method == "POST":
+            body = json.loads(str(await request.text()))
+            toggle_id = body.get("id", "")
+            screeners = await self._get_screeners()
+            for s in screeners:
+                if s["id"] == toggle_id:
+                    s["enabled"] = not s.get("enabled", True)
+                    break
+            await self.env.KV.put("screeners", json.dumps(screeners))
+            return self._json({"ok": True, "screeners": screeners})
+
+        # ── API: Manual Trigger ──
+        if "/api/trigger" in url and method == "POST":
+            screeners = await self._get_screeners()
+            count = 0
+            for s in screeners:
+                if s.get("enabled", True):
+                    await self._run_single(s)
+                    count += 1
+            return self._json({"ok": True, "triggered": count})
+
+        # CORS preflight
+        if method == "OPTIONS":
+            return Response("", headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type",
+            })
+
+        # ── Dashboard HTML ──
+        return Response(DASHBOARD_HTML, headers={"Content-Type": "text/html"})
+
+    async def scheduled(self, event, env, ctx):
+        settings = await self._get_settings()
+        if not settings.get("enabled", True):
+            return
+
+        from datetime import datetime, timezone, timedelta
+        IST = timezone(timedelta(hours=5, minutes=30))
+        now = datetime.now(IST)
+
+        # Interval gate
+        interval = settings.get("interval_minutes", 1)
+        last_run_str = settings.get("last_run", "")
+        if last_run_str and interval > 1:
+            try:
+                last_run = datetime.fromisoformat(last_run_str)
+                if (now - last_run).total_seconds() / 60 < interval:
+                    return
+            except:
+                pass
+
+        # Time window gate
+        try:
+            sh, sm = map(int, settings.get("start_time", "09:15").split(":"))
+            eh, em = map(int, settings.get("end_time", "15:30").split(":"))
+            now_m = now.hour * 60 + now.minute
+            if now_m < sh * 60 + sm or now_m > eh * 60 + em:
+                return
+        except:
+            pass
+
+        # Date window gate
+        today = now.strftime("%Y-%m-%d")
+        sd = settings.get("start_date", "")
+        ed = settings.get("end_date", "")
+        if sd and today < sd:
+            return
+        if ed and today > ed:
+            return
+
+        # ── Run all enabled screeners ──
+        screeners = await self._get_screeners()
+        for s in screeners:
+            if s.get("enabled", True):
+                await self._run_single(s)
+
+        settings["last_run"] = now.isoformat()
+        settings["total_runs"] = settings.get("total_runs", 0) + 1
+        await self.env.KV.put("settings", json.dumps(settings))
+
+    # ─── Helpers ───
+
+    def _json(self, data):
+        return Response(json.dumps(data), headers={
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+        })
+
+    async def _get_settings(self):
+        raw = await self.env.KV.get("settings")
+        if raw:
+            saved = json.loads(str(raw))
+            m = dict(DEFAULT_SETTINGS)
+            m.update(saved)
+            return m
+        return dict(DEFAULT_SETTINGS)
+
+    async def _get_screeners(self):
+        raw = await self.env.KV.get("screeners")
+        if raw:
+            return json.loads(str(raw))
+        # First run — seed from hardcoded list
+        await self.env.KV.put("screeners", json.dumps(SCREENERS))
+        return list(SCREENERS)
+
+    async def _run_single(self, screener):
+        sid = screener["id"]
+        scr_url = screener["url"]
+        scr_query = screener["query"]
+        scr_name = screener.get("name", sid)
+        try:
+            get_headers = Headers.new(to_js({
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+            }))
+            get_resp = await fetch(scr_url, method="GET", headers=get_headers)
+            html = await get_resp.text()
+            csrf_token = extract_csrf(str(html))
+
+            set_cookie = str(get_resp.headers.get("set-cookie") or "")
+            csrf_cookie = ""
+            for part in set_cookie.split(";"):
+                part = part.strip()
+                if part.startswith("csrftoken="):
+                    csrf_cookie = part
+                    break
+
+            body = f"csrfmiddlewaretoken={csrf_token}&query={url_encode(scr_query)}&order="
+            post_headers = Headers.new(to_js({
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": scr_url,
+                "Origin": "https://www.screener.in",
+                "X-Requested-With": "XMLHttpRequest",
+                "Cookie": csrf_cookie,
+            }))
+            post_resp = await fetch(scr_url, method="POST", body=body, headers=post_headers)
+            result_html = str(await post_resp.text())
+
+            headers_row, rows = parse_table(result_html)
+
+            prev_key = f"prev_names_{sid}"
+            prev_json = await self.env.KV.get(prev_key)
+            prev_names = json.loads(str(prev_json)) if prev_json else []
+            curr_names = [dict(zip(headers_row, r)).get("Name", "") for r in rows]
+
+            msg = format_message(scr_name, headers_row, rows, curr_names, prev_names)
+            await send_telegram(str(self.env.TELEGRAM_TOKEN), str(self.env.TELEGRAM_CHAT_ID), msg)
+
+            await self.env.KV.put(prev_key, json.dumps(curr_names))
+
+        except Exception as e:
+            await send_telegram(str(self.env.TELEGRAM_TOKEN), str(self.env.TELEGRAM_CHAT_ID),
+                                f"❌ <b>[{scr_name}] Error:</b> {str(e)}")
+
+
+# ─── Pure functions ───
+
+def extract_csrf(html: str) -> str:
+    for line in html.split("\n"):
+        if "csrfmiddlewaretoken" in line:
+            try: return line.split('value="')[1].split('"')[0]
+            except: pass
+    return ""
+
+def url_encode(text: str) -> str:
+    result = ""
+    safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~ "
+    for ch in text:
+        if ch in safe:
+            result += "+" if ch == " " else ch
+        else:
+            result += "".join(f"%{b:02X}" for b in ch.encode())
+    return result
+
+def parse_table(html: str):
+    headers, rows = [], []
+    for part in html.split("<th")[1:]:
+        cell = extract_between(part, ">", "</th>")
+        while "<" in cell and ">" in cell:
+            cell = cell[:cell.find("<")] + cell[cell.find(">")+1:]
+        clean = " ".join(cell.split())
+        if clean:
+            headers.append(clean)
+    tbody = extract_between(html, "<tbody>", "</tbody>")
+    for tr in tbody.split("<tr")[1:]:
+        cells = []
+        for td in tr.split("<td")[1:]:
+            inner = extract_between(td, ">", "</td>")
+            if "<a" in inner:
+                inner = extract_between(inner, ">", "</a>")
+            while "<" in inner and ">" in inner:
+                inner = inner[:inner.find("<")] + inner[inner.find(">")+1:]
+            cells.append(" ".join(inner.split()))
+        if cells:
+            rows.append(cells)
+    return headers, rows
+
+def extract_between(s: str, start: str, end: str) -> str:
+    i = s.find(start)
+    if i == -1: return ""
+    i += len(start)
+    j = s.find(end, i)
+    if j == -1: return ""
+    return s[i:j]
+
+def sign(val):
+    try: return "🟢" if float(val) >= 0 else "🔴"
+    except: return "⚪"
+
+def format_message(screen_name, headers, rows, curr_names, prev_names):
+    from datetime import datetime, timezone, timedelta
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now = datetime.now(IST).strftime("%d %b %Y, %I:%M:%S %p IST")
+    entered = [n for n in curr_names if n not in prev_names]
+    exited  = [n for n in prev_names if n not in curr_names]
+    lines = [f"📊 <b>{screen_name}</b>", f"🕐 {now}", "━━━━━━━━━━━━━━━━"]
+    if entered: lines.append(f"🆕 <b>NEW:</b> {', '.join(entered)}")
+    if exited:  lines.append(f"🚪 <b>EXITED:</b> {', '.join(exited)}")
+    if entered or exited: lines.append("━━━━━━━━━━━━━━━━")
+    if not rows:
+        lines.append("⚠️ <b>No stocks passed filters</b>")
+        return "\n".join(lines)
+    lines.append(f"✅ <b>{len(rows)} stock(s) passed</b>\n")
+    for row in rows:
+        d = dict(zip(headers, row))
+        name   = d.get("Name", "?")
+        cmp    = d.get("CMP Rs.", "?")
+        pe     = d.get("P/E", "?")
+        roce   = d.get("ROCE %", "?")
+        ret1w  = d.get("1wk return %", "?")
+        ret1m  = d.get("1mth return %", "?")
+        mktcap = d.get("Mar Cap Rs.Cr.", "?")
+        np_qtr = d.get("NP Qtr Rs.Cr.", "?")
+        qpv    = d.get("Qtr Profit Var %", "?")
+        t      = name.replace(" ","").replace(".","").replace("Inds","").upper()
+        tag    = "🆕 " if name in entered else ""
+        lines.append(
+            f"{tag}🏢 <b>{name}</b>\n"
+            f"   💰 CMP: <b>₹{cmp}</b>  |  P/E: {pe}\n"
+            f"   📈 ROCE: {roce}%  |  Mkt Cap: ₹{mktcap} Cr\n"
+            f"   {sign(ret1w)} 1W: {ret1w}%  |  {sign(ret1m)} 1M: {ret1m}%\n"
+            f"   💹 NP Qtr: ₹{np_qtr} Cr  |  Profit Var: {sign(qpv)}{qpv}%\n"
+            f"   🔗 <a href='https://www.screener.in/company/{t}/'>View</a>"
+        )
+        lines.append("─────────────────")
+    return "\n".join(lines)
+
+async def send_telegram(token: str, chat_id: str, text: str):
+    url  = f"https://api.telegram.org/bot{token}/sendMessage"
+    body = json.dumps({"chat_id": chat_id, "text": text,
+                       "parse_mode": "HTML", "disable_web_page_preview": True})
+    hdrs = Headers.new(to_js({"Content-Type": "application/json"}))
+    await fetch(url, method="POST", body=body, headers=hdrs)
+
+
+# ─── Dashboard HTML ───
+
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Screener Alerts — Multi</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0a0a0f;--s1:#12121a;--s2:#1a1a26;--s3:#22222f;
+  --bdr:#2a2a3a;--t1:#e4e4ed;--t2:#9494a8;--t3:#6a6a80;
+  --acc:#6c5ce7;--acc2:#a29bfe;--accg:rgba(108,92,231,.15);
+  --grn:#00d68f;--grng:rgba(0,214,143,.12);
+  --red:#ff6b6b;--redg:rgba(255,107,107,.12);
+  --r:12px;--rl:16px;
+}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--t1);min-height:100vh}
+.c{max-width:760px;margin:0 auto;padding:24px 16px}
+.hdr{text-align:center;margin-bottom:28px;padding:28px 0 20px}
+.hdr h1{font-size:22px;font-weight:700;letter-spacing:-.5px}
+.hdr h1 span{color:var(--acc2)}
+.hdr p{color:var(--t3);font-size:13px;margin-top:4px}
+
+/* Status */
+.sbar{display:flex;align-items:center;gap:10px;padding:14px 18px;background:var(--s1);border:1px solid var(--bdr);border-radius:var(--r);margin-bottom:16px}
+.sdot{width:10px;height:10px;border-radius:50%;flex-shrink:0;animation:pulse 2s ease-in-out infinite}
+.sdot.on{background:var(--grn);box-shadow:0 0 8px var(--grn)}.sdot.off{background:var(--red);box-shadow:0 0 8px var(--red);animation:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.stxt{font-size:13px;color:var(--t2);flex:1}.stxt b{color:var(--t1);font-weight:600}
+.sruns{font-size:12px;color:var(--t3)}
+
+/* Card */
+.cd{background:var(--s1);border:1px solid var(--bdr);border-radius:var(--rl);padding:20px;margin-bottom:14px;transition:border-color .2s}
+.cd:hover{border-color:var(--s3)}
+.ct{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1.2px;color:var(--t3);margin-bottom:14px}
+
+/* Toggle */
+.trow{display:flex;align-items:center;justify-content:space-between;gap:16px}
+.tlbl{font-size:15px;font-weight:500}.tsub{font-size:12px;color:var(--t3);margin-top:2px}
+.tgl{position:relative;width:52px;height:28px;flex-shrink:0}
+.tgl input{opacity:0;width:0;height:0}
+.tgl .sl{position:absolute;inset:0;background:var(--s3);border-radius:14px;cursor:pointer;transition:.3s}
+.tgl .sl:before{content:'';position:absolute;width:22px;height:22px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.3s}
+.tgl input:checked+.sl{background:var(--grn)}.tgl input:checked+.sl:before{transform:translateX(24px)}
+
+/* Fields */
+.fg{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
+.f{display:flex;flex-direction:column;gap:4px}
+.f label{font-size:11px;font-weight:500;color:var(--t3);text-transform:uppercase;letter-spacing:.8px}
+.f select,.f input{background:var(--s2);border:1px solid var(--bdr);border-radius:8px;padding:10px 12px;color:var(--t1);font-family:inherit;font-size:14px;outline:none;transition:.2s;width:100%}
+.f select:focus,.f input:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--accg)}
+.f select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%236a6a80'%3E%3Cpath d='M6 8L1 3h10z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center}
+
+/* Buttons */
+.brow{display:flex;gap:10px;margin-top:16px}
+.btn{flex:1;padding:12px;border:none;border-radius:var(--r);font-family:inherit;font-size:14px;font-weight:600;cursor:pointer;transition:.2s;display:flex;align-items:center;justify-content:center;gap:6px}
+.bp{background:var(--acc);color:#fff}.bp:hover{background:#5b4bd5;box-shadow:0 4px 16px var(--accg)}.bp:active{transform:scale(.97)}
+.bs{background:var(--s2);color:var(--t1);border:1px solid var(--bdr)}.bs:hover{background:var(--s3)}
+.bd{background:transparent;color:var(--red);border:1px solid var(--red);flex:0;padding:12px 16px}
+.bd:hover{background:var(--redg)}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-sm{padding:8px 14px;font-size:12px;flex:0}
+
+/* Screener list */
+.scr-item{background:var(--s2);border:1px solid var(--bdr);border-radius:var(--r);padding:14px 16px;margin-bottom:10px;display:flex;align-items:center;gap:12px;transition:border-color .2s}
+.scr-item:hover{border-color:var(--t3)}
+.scr-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.scr-dot.on{background:var(--grn)}.scr-dot.off{background:var(--red)}
+.scr-info{flex:1;min-width:0}
+.scr-name{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.scr-url{font-size:11px;color:var(--t3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.scr-actions{display:flex;gap:6px;flex-shrink:0}
+.scr-btn{background:var(--s3);border:1px solid var(--bdr);border-radius:6px;padding:6px 10px;font-size:11px;color:var(--t2);cursor:pointer;transition:.2s;font-family:inherit}
+.scr-btn:hover{border-color:var(--t3);color:var(--t1)}
+.scr-btn.del{color:var(--red);border-color:transparent}.scr-btn.del:hover{border-color:var(--red);background:var(--redg)}
+
+/* Modal */
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);display:none;z-index:50;justify-content:center;align-items:center}
+.modal-bg.show{display:flex}
+.modal{background:var(--s1);border:1px solid var(--bdr);border-radius:var(--rl);padding:24px;width:90%;max-width:520px;max-height:80vh;overflow-y:auto}
+.modal h2{font-size:16px;font-weight:700;margin-bottom:16px}
+.modal .f{margin-bottom:12px}
+.modal .f textarea{background:var(--s2);border:1px solid var(--bdr);border-radius:8px;padding:10px 12px;color:var(--t1);font-family:'Courier New',monospace;font-size:12px;outline:none;width:100%;min-height:120px;resize:vertical;transition:.2s}
+.modal .f textarea:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--accg)}
+
+/* Toast */
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(80px);padding:12px 24px;border-radius:var(--r);font-size:13px;font-weight:500;background:var(--s2);border:1px solid var(--bdr);color:var(--t1);box-shadow:0 8px 32px rgba(0,0,0,.4);transition:.4s cubic-bezier(.4,0,.2,1);z-index:100;white-space:nowrap}
+.toast.show{transform:translateX(-50%) translateY(0)}
+.toast.ok{border-color:var(--grn);background:linear-gradient(135deg,var(--s2),rgba(0,214,143,.08))}
+.toast.err{border-color:var(--red);background:linear-gradient(135deg,var(--s2),rgba(255,107,107,.08))}
+
+.spinner{width:16px;height:16px;border:2px solid transparent;border-top:2px solid currentColor;border-radius:50%;animation:spin .6s linear infinite;display:none}
+@keyframes spin{to{transform:rotate(360deg)}}
+.footer{text-align:center;padding:20px 0;font-size:11px;color:var(--t3)}.footer a{color:var(--acc2);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="c">
+  <div class="hdr">
+    <h1>📊 <span>Screener Alerts</span> Multi</h1>
+    <p>Cloudflare Worker • Multiple Screeners → Telegram</p>
+  </div>
+
+  <!-- Status -->
+  <div class="sbar">
+    <div class="sdot" id="dot"></div>
+    <div class="stxt" id="stxt">Loading...</div>
+    <div class="sruns" id="sruns"></div>
+  </div>
+
+  <!-- Power -->
+  <div class="cd">
+    <div class="ct">Global Power</div>
+    <div class="trow">
+      <div><div class="tlbl" id="pLbl">Cron Enabled</div><div class="tsub" id="pSub">All screeners</div></div>
+      <label class="tgl"><input type="checkbox" id="enTgl" onchange="saveSets()"><span class="sl"></span></label>
+    </div>
+  </div>
+
+  <!-- Schedule -->
+  <div class="cd">
+    <div class="ct">Schedule (IST)</div>
+    <div class="fg">
+      <div class="f"><label>Interval</label>
+        <select id="intSel" onchange="saveSets()">
+          <option value="1">Every 1 min</option><option value="2">Every 2 min</option>
+          <option value="3">Every 3 min</option><option value="5">Every 5 min</option>
+          <option value="10">Every 10 min</option><option value="15">Every 15 min</option>
+          <option value="30">Every 30 min</option><option value="60">Every 1 hour</option>
+        </select>
+      </div>
+      <div class="f"><label>Last Run</label><input id="lrDisp" readonly style="color:var(--t3);cursor:default"></div>
+    </div>
+  </div>
+
+  <!-- Time Window -->
+  <div class="cd">
+    <div class="ct">Active Window (IST)</div>
+    <div class="fg">
+      <div class="f"><label>Start Time</label><input type="time" id="sTime" onchange="saveSets()"></div>
+      <div class="f"><label>End Time</label><input type="time" id="eTime" onchange="saveSets()"></div>
+    </div>
+    <div class="fg" style="margin-top:12px">
+      <div class="f"><label>Start Date</label><input type="date" id="sDate" onchange="saveSets()"></div>
+      <div class="f"><label>End Date</label><input type="date" id="eDate" onchange="saveSets()"></div>
+    </div>
+  </div>
+
+  <!-- Screeners -->
+  <div class="cd">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <div class="ct" style="margin:0">Screeners</div>
+      <button class="btn bp btn-sm" onclick="openModal()">+ Add</button>
+    </div>
+    <div id="scrList"></div>
+  </div>
+
+  <!-- Actions -->
+  <div class="brow">
+    <button class="btn bp" id="trigBtn" onclick="trigNow()">⚡ Run All Now <div class="spinner" id="trigSp"></div></button>
+    <button class="btn bs" onclick="load()">🔄 Refresh</button>
+  </div>
+
+  <div class="footer"><a href="https://www.screener.in" target="_blank">screener.in ↗</a></div>
+</div>
+
+<!-- Add/Edit Modal -->
+<div class="modal-bg" id="modalBg" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <h2 id="modalTitle">Add Screener</h2>
+    <div class="f"><label>ID (slug, no spaces)</label><input id="mId" placeholder="my-screen"></div>
+    <div class="f"><label>Name</label><input id="mName" placeholder="My Screen — Description"></div>
+    <div class="f"><label>Screener.in URL</label><input id="mUrl" placeholder="https://www.screener.in/screens/..."></div>
+    <div class="f"><label>Query</label><textarea id="mQuery" placeholder="Is not SME AND&#10;Market Capitalization > 200 AND&#10;..."></textarea></div>
+    <div class="brow">
+      <button class="btn bp" onclick="saveScr()">💾 Save</button>
+      <button class="btn bs" onclick="closeModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const A=location.origin;
+let _sets={},_scrs=[];
+
+async function load(){
+  try{
+    const[sr,sc]=await Promise.all([fetch(A+'/api/settings').then(r=>r.json()),fetch(A+'/api/screeners').then(r=>r.json())]);
+    _sets=sr;_scrs=sc;
+    document.getElementById('enTgl').checked=sr.enabled;
+    document.getElementById('intSel').value=String(sr.interval_minutes||1);
+    document.getElementById('sTime').value=sr.start_time||'09:15';
+    document.getElementById('eTime').value=sr.end_time||'15:30';
+    document.getElementById('sDate').value=sr.start_date||'';
+    document.getElementById('eDate').value=sr.end_date||'';
+    updStatus(sr);renderScrs(sc);
+  }catch(e){toast('Failed to load','err')}
+}
+
+function updStatus(s){
+  const d=document.getElementById('dot'),t=document.getElementById('stxt'),r=document.getElementById('sruns');
+  const enabled=_scrs.filter(x=>x.enabled!==false).length;
+  if(s.enabled){d.className='sdot on';t.innerHTML=`<b>Active</b> · ${enabled} screener(s) · ${s.start_time}–${s.end_time} IST · every ${s.interval_minutes} min`}
+  else{d.className='sdot off';t.innerHTML='<b>Paused</b> · All cron triggers skipped'}
+  r.innerHTML=s.total_runs?'🔢 '+s.total_runs+' runs':'';
+  const lr=document.getElementById('lrDisp');
+  if(s.last_run){try{lr.value=new Date(s.last_run).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit',second:'2-digit',day:'2-digit',month:'short',year:'numeric',hour12:true})}catch(e){lr.value=s.last_run}}
+  else lr.value='Never';
+}
+
+function renderScrs(list){
+  const el=document.getElementById('scrList');
+  if(!list.length){el.innerHTML='<div style="text-align:center;padding:24px;color:var(--t3)">No screeners configured. Click + Add to get started.</div>';return}
+  el.innerHTML=list.map(s=>`
+    <div class="scr-item">
+      <div class="scr-dot ${s.enabled!==false?'on':'off'}"></div>
+      <div class="scr-info">
+        <div class="scr-name">${esc(s.name||s.id)}</div>
+        <div class="scr-url">${esc(s.url||'')}</div>
+      </div>
+      <div class="scr-actions">
+        <button class="scr-btn" onclick="toggleScr('${s.id}')">${s.enabled!==false?'⏸ Pause':'▶ Resume'}</button>
+        <button class="scr-btn" onclick="editScr('${s.id}')">✏️</button>
+        <button class="scr-btn del" onclick="delScr('${s.id}')">🗑</button>
+      </div>
+    </div>`).join('');
+}
+
+let _timer;
+async function saveSets(){
+  clearTimeout(_timer);_timer=setTimeout(async()=>{
+    try{
+      const p={enabled:document.getElementById('enTgl').checked,interval_minutes:parseInt(document.getElementById('intSel').value),
+        start_time:document.getElementById('sTime').value,end_time:document.getElementById('eTime').value,
+        start_date:document.getElementById('sDate').value,end_date:document.getElementById('eDate').value};
+      const r=await fetch(A+'/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});
+      const d=await r.json();if(d.ok){_sets=d.settings;updStatus(d.settings);toast('Settings saved ✓','ok')}
+    }catch(e){toast('Save failed','err')}
+  },300);
+}
+
+async function toggleScr(id){
+  try{const r=await fetch(A+'/api/screeners/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+  const d=await r.json();if(d.ok){_scrs=d.screeners;renderScrs(_scrs);updStatus(_sets);toast('Toggled ✓','ok')}}catch(e){toast('Failed','err')}
+}
+async function delScr(id){
+  if(!confirm('Delete this screener?'))return;
+  try{const r=await fetch(A+'/api/screeners/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+  const d=await r.json();if(d.ok){_scrs=d.screeners;renderScrs(_scrs);updStatus(_sets);toast('Deleted ✓','ok')}}catch(e){toast('Failed','err')}
+}
+
+function openModal(s){
+  document.getElementById('modalTitle').textContent=s?'Edit Screener':'Add Screener';
+  document.getElementById('mId').value=s?s.id:'';document.getElementById('mId').readOnly=!!s;
+  document.getElementById('mName').value=s?s.name:'';
+  document.getElementById('mUrl').value=s?s.url:'';
+  document.getElementById('mQuery').value=s?s.query:'';
+  document.getElementById('modalBg').classList.add('show');
+}
+function closeModal(){document.getElementById('modalBg').classList.remove('show')}
+function editScr(id){const s=_scrs.find(x=>x.id===id);if(s)openModal(s)}
+
+async function saveScr(){
+  const o={id:document.getElementById('mId').value.trim(),name:document.getElementById('mName').value.trim(),
+    url:document.getElementById('mUrl').value.trim(),query:document.getElementById('mQuery').value.trim(),enabled:true};
+  if(!o.id||!o.url||!o.query){toast('Fill all fields','err');return}
+  try{const r=await fetch(A+'/api/screeners',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});
+  const d=await r.json();if(d.ok){_scrs=d.screeners;renderScrs(_scrs);closeModal();toast('Saved ✓','ok')}}catch(e){toast('Failed','err')}
+}
+
+async function trigNow(){
+  const b=document.getElementById('trigBtn'),sp=document.getElementById('trigSp');b.disabled=true;sp.style.display='inline-block';
+  try{const r=await fetch(A+'/api/trigger',{method:'POST'});const d=await r.json();toast(`⚡ Triggered ${d.triggered} screener(s)!`,'ok');setTimeout(load,2000)}
+  catch(e){toast('Failed','err')}finally{b.disabled=false;sp.style.display='none'}
+}
+
+function toast(m,t){const e=document.getElementById('toast');e.textContent=m;e.className='toast '+t+' show';setTimeout(()=>e.className='toast',2500)}
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+
+load();
+</script>
+</body>
+</html>"""

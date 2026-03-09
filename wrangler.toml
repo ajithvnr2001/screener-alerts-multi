@@ -1,0 +1,11 @@
+name = "screener-alerts-multi"
+main = "worker.py"
+compatibility_date = "2025-12-01"
+compatibility_flags = ["python_workers"]
+
+[triggers]
+crons = ["* * * * *"]  # every 1 minute — gated by KV settings
+
+[[kv_namespaces]]
+binding = "KV"
+id = "18cfb3e0c6484f939f409e547ae795c1"
