@@ -33,6 +33,12 @@ RSI < 78 AND
 MACD > MACD Signal AND
 Volume > Volume 1month average""",
         "enabled": True,
+        "interval_minutes": 5,
+        "start_time": "09:15",
+        "end_time": "15:30",
+        "start_date": "",
+        "end_date": "",
+        "last_run_epoch": 0,
     },
     {
         "id": "opus-tele",
@@ -72,18 +78,25 @@ Price to Earning < 80 AND
 YOY Quarterly sales growth > 10 AND
 YOY Quarterly profit growth > 10""",
         "enabled": True,
+        "interval_minutes": 5,
+        "start_time": "09:15",
+        "end_time": "15:30",
+        "start_date": "",
+        "end_date": "",
+        "last_run_epoch": 0,
     },
 ]
 
 DEFAULT_SETTINGS = {
     "enabled": True,
-    "interval_minutes": 1,
+    "schedule_mode": "global",
+    "interval_minutes": 5,
     "start_time": "09:15",
     "end_time": "15:30",
     "start_date": "",
     "end_date": "",
     "last_run": "",
-    "last_run_ts": 0,
+    "last_run_epoch": 0,
     "total_runs": 0,
 }
 
@@ -105,11 +118,10 @@ class Default(WorkerEntrypoint):
             await self.env.KV.put("settings", json.dumps(cur))
             return self._json({"ok": True, "settings": cur})
 
-        # ── API: Screener List ──
+        # ── API: Screener routes (specific first) ──
         if "/api/screeners" in url and method == "GET":
             return self._json(await self._get_screeners())
 
-        # Specific routes FIRST (they also match "/api/screeners")
         if "/api/screeners/delete" in url and method == "POST":
             body = json.loads(str(await request.text()))
             del_id = body.get("id", "")
@@ -129,7 +141,6 @@ class Default(WorkerEntrypoint):
             await self.env.KV.put("screeners", json.dumps(screeners))
             return self._json({"ok": True, "screeners": screeners})
 
-        # Generic add/update (must come AFTER specific sub-routes)
         if "/api/screeners" in url and method == "POST":
             body = json.loads(str(await request.text()))
             screeners = await self._get_screeners()
@@ -162,7 +173,6 @@ class Default(WorkerEntrypoint):
                 "Access-Control-Allow-Headers": "Content-Type",
             })
 
-        # ── Dashboard HTML ──
         return Response(DASHBOARD_HTML, headers={"Content-Type": "text/html"})
 
     async def scheduled(self, event, env, ctx):
@@ -174,48 +184,77 @@ class Default(WorkerEntrypoint):
         IST = timezone(timedelta(hours=5, minutes=30))
         now = datetime.now(IST)
         now_epoch = int(now.timestamp())
-
-        # Interval gate
-        interval = int(settings.get("interval_minutes", 1))
-        last_epoch = int(settings.get("last_run_epoch", 0))
-        if last_epoch and interval > 1:
-            elapsed_min = (now_epoch - last_epoch) / 60
-            if elapsed_min < interval:
-                return
-
-        # Time window gate
-        try:
-            sh, sm = map(int, settings.get("start_time", "09:15").split(":"))
-            eh, em = map(int, settings.get("end_time", "15:30").split(":"))
-            now_m = now.hour * 60 + now.minute
-            if now_m < sh * 60 + sm or now_m > eh * 60 + em:
-                return
-        except:
-            pass
-
-        # Date window gate
         today = now.strftime("%Y-%m-%d")
-        sd = settings.get("start_date", "")
-        ed = settings.get("end_date", "")
-        if sd and today < sd:
-            return
-        if ed and today > ed:
-            return
+        now_m = now.hour * 60 + now.minute
 
-        # ── Run all enabled screeners ──
+        mode = settings.get("schedule_mode", "global")
         screeners = await self._get_screeners()
-        for s in screeners:
-            if s.get("enabled", True):
-                await self._run_single(s)
 
-        # Re-read settings FRESH to avoid overwriting user changes
-        fresh = await self._get_settings()
-        fresh["last_run"] = now.isoformat()
-        fresh["last_run_epoch"] = now_epoch
-        fresh["total_runs"] = fresh.get("total_runs", 0) + 1
-        await self.env.KV.put("settings", json.dumps(fresh))
+        if mode == "global":
+            # ── Global schedule: single gate for all ──
+            interval = int(settings.get("interval_minutes", 1))
+            last_epoch = int(settings.get("last_run_epoch", 0))
+            if last_epoch and interval > 1:
+                if (now_epoch - last_epoch) / 60 < interval:
+                    return
+
+            if not self._in_time_window(settings, now_m, today):
+                return
+
+            for s in screeners:
+                if s.get("enabled", True):
+                    await self._run_single(s)
+
+            fresh = await self._get_settings()
+            fresh["last_run"] = now.isoformat()
+            fresh["last_run_epoch"] = now_epoch
+            fresh["total_runs"] = fresh.get("total_runs", 0) + 1
+            await self.env.KV.put("settings", json.dumps(fresh))
+
+        else:
+            # ── Individual schedule: per-screener gates ──
+            ran_any = False
+            for s in screeners:
+                if not s.get("enabled", True):
+                    continue
+
+                s_interval = int(s.get("interval_minutes", 5))
+                s_last = int(s.get("last_run_epoch", 0))
+                if s_last and s_interval > 1:
+                    if (now_epoch - s_last) / 60 < s_interval:
+                        continue
+
+                if not self._in_time_window(s, now_m, today):
+                    continue
+
+                await self._run_single(s)
+                s["last_run_epoch"] = now_epoch
+                ran_any = True
+
+            if ran_any:
+                await self.env.KV.put("screeners", json.dumps(screeners))
+                fresh = await self._get_settings()
+                fresh["last_run"] = now.isoformat()
+                fresh["total_runs"] = fresh.get("total_runs", 0) + 1
+                await self.env.KV.put("settings", json.dumps(fresh))
 
     # ─── Helpers ───
+
+    def _in_time_window(self, cfg, now_m, today):
+        try:
+            sh, sm = map(int, cfg.get("start_time", "09:15").split(":"))
+            eh, em = map(int, cfg.get("end_time", "15:30").split(":"))
+            if now_m < sh * 60 + sm or now_m > eh * 60 + em:
+                return False
+        except:
+            pass
+        sd = cfg.get("start_date", "")
+        ed = cfg.get("end_date", "")
+        if sd and today < sd:
+            return False
+        if ed and today > ed:
+            return False
+        return True
 
     def _json(self, data):
         return Response(json.dumps(data), headers={
@@ -236,7 +275,6 @@ class Default(WorkerEntrypoint):
         raw = await self.env.KV.get("screeners")
         if raw:
             return json.loads(str(raw))
-        # First run — seed from hardcoded list
         await self.env.KV.put("screeners", json.dumps(SCREENERS))
         return list(SCREENERS)
 
@@ -293,14 +331,14 @@ class Default(WorkerEntrypoint):
 
 # ─── Pure functions ───
 
-def extract_csrf(html: str) -> str:
+def extract_csrf(html):
     for line in html.split("\n"):
         if "csrfmiddlewaretoken" in line:
             try: return line.split('value="')[1].split('"')[0]
             except: pass
     return ""
 
-def url_encode(text: str) -> str:
+def url_encode(text):
     result = ""
     safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~ "
     for ch in text:
@@ -310,7 +348,7 @@ def url_encode(text: str) -> str:
             result += "".join(f"%{b:02X}" for b in ch.encode())
     return result
 
-def parse_table(html: str):
+def parse_table(html):
     headers, rows = [], []
     for part in html.split("<th")[1:]:
         cell = extract_between(part, ">", "</th>")
@@ -333,7 +371,7 @@ def parse_table(html: str):
             rows.append(cells)
     return headers, rows
 
-def extract_between(s: str, start: str, end: str) -> str:
+def extract_between(s, start, end):
     i = s.find(start)
     if i == -1: return ""
     i += len(start)
@@ -359,20 +397,13 @@ def format_message(screen_name, headers, rows, curr_names, prev_names):
         lines.append("⚠️ <b>No stocks passed filters</b>")
         return "\n".join(lines)
     lines.append(f"✅ <b>{len(rows)} stock(s) passed</b>\n")
-
-    # Columns to skip in the detail display
     skip = {"S.No.", "Is not SME"}
-
     for row in rows:
         d = dict(zip(headers, row))
         name = d.get("Name", "?")
         t = name.replace(" ","").replace(".","").replace("Inds","").upper()
         tag = "🆕 " if name in entered else ""
-
-        # Header line
         block = f"{tag}🏢 <b>{name}</b>\n"
-
-        # Show all columns as key: value pairs, 2 per line
         items = []
         for h in headers:
             if h in skip or h == "Name":
@@ -380,8 +411,6 @@ def format_message(screen_name, headers, rows, curr_names, prev_names):
             val = d.get(h, "")
             if not val:
                 continue
-            # Add emoji for known fields
-            label = h
             if "CMP" in h:
                 items.append(f"💰 CMP: <b>₹{val}</b>")
             elif "return" in h.lower():
@@ -408,18 +437,15 @@ def format_message(screen_name, headers, rows, curr_names, prev_names):
                 items.append(f"{h.replace(' %','')}: {val}%")
             else:
                 items.append(f"{h}: {val}")
-
-        # Print 2 items per line
         for i in range(0, len(items), 2):
             pair = items[i:i+2]
             block += "   " + "  |  ".join(pair) + "\n"
-
         block += f"   🔗 <a href='https://www.screener.in/company/{t}/'>View</a>"
         lines.append(block)
         lines.append("─────────────────")
     return "\n".join(lines)
 
-async def send_telegram(token: str, chat_id: str, text: str):
+async def send_telegram(token, chat_id, text):
     url  = f"https://api.telegram.org/bot{token}/sendMessage"
     body = json.dumps({"chat_id": chat_id, "text": text,
                        "parse_mode": "HTML", "disable_web_page_preview": True})
@@ -453,7 +479,6 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--t1);min-hei
 .hdr h1 span{color:var(--acc2)}
 .hdr p{color:var(--t3);font-size:13px;margin-top:4px}
 
-/* Status */
 .sbar{display:flex;align-items:center;gap:10px;padding:14px 18px;background:var(--s1);border:1px solid var(--bdr);border-radius:var(--r);margin-bottom:16px}
 .sdot{width:10px;height:10px;border-radius:50%;flex-shrink:0;animation:pulse 2s ease-in-out infinite}
 .sdot.on{background:var(--grn);box-shadow:0 0 8px var(--grn)}.sdot.off{background:var(--red);box-shadow:0 0 8px var(--red);animation:none}
@@ -461,12 +486,10 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--t1);min-hei
 .stxt{font-size:13px;color:var(--t2);flex:1}.stxt b{color:var(--t1);font-weight:600}
 .sruns{font-size:12px;color:var(--t3)}
 
-/* Card */
 .cd{background:var(--s1);border:1px solid var(--bdr);border-radius:var(--rl);padding:20px;margin-bottom:14px;transition:border-color .2s}
 .cd:hover{border-color:var(--s3)}
 .ct{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1.2px;color:var(--t3);margin-bottom:14px}
 
-/* Toggle */
 .trow{display:flex;align-items:center;justify-content:space-between;gap:16px}
 .tlbl{font-size:15px;font-weight:500}.tsub{font-size:12px;color:var(--t3);margin-top:2px}
 .tgl{position:relative;width:52px;height:28px;flex-shrink:0}
@@ -475,7 +498,6 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--t1);min-hei
 .tgl .sl:before{content:'';position:absolute;width:22px;height:22px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.3s}
 .tgl input:checked+.sl{background:var(--grn)}.tgl input:checked+.sl:before{transform:translateX(24px)}
 
-/* Fields */
 .fg{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
 .f{display:flex;flex-direction:column;gap:4px}
 .f label{font-size:11px;font-weight:500;color:var(--t3);text-transform:uppercase;letter-spacing:.8px}
@@ -483,19 +505,26 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--t1);min-hei
 .f select:focus,.f input:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--accg)}
 .f select{cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%236a6a80'%3E%3Cpath d='M6 8L1 3h10z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center}
 
-/* Buttons */
 .brow{display:flex;gap:10px;margin-top:16px}
 .btn{flex:1;padding:12px;border:none;border-radius:var(--r);font-family:inherit;font-size:14px;font-weight:600;cursor:pointer;transition:.2s;display:flex;align-items:center;justify-content:center;gap:6px}
 .bp{background:var(--acc);color:#fff}.bp:hover{background:#5b4bd5;box-shadow:0 4px 16px var(--accg)}.bp:active{transform:scale(.97)}
 .bs{background:var(--s2);color:var(--t1);border:1px solid var(--bdr)}.bs:hover{background:var(--s3)}
-.bd{background:transparent;color:var(--red);border:1px solid var(--red);flex:0;padding:12px 16px}
-.bd:hover{background:var(--redg)}
 .btn:disabled{opacity:.5;cursor:not-allowed}
 .btn-sm{padding:8px 14px;font-size:12px;flex:0}
 
+/* Mode selector */
+.mode-sel{display:flex;gap:0;border-radius:8px;overflow:hidden;border:1px solid var(--bdr);margin-bottom:16px}
+.mode-btn{flex:1;padding:10px;text-align:center;font-size:13px;font-weight:600;cursor:pointer;background:var(--s2);color:var(--t3);border:none;font-family:inherit;transition:.2s}
+.mode-btn.active{background:var(--acc);color:#fff}
+.mode-btn:hover:not(.active){background:var(--s3);color:var(--t2)}
+
+/* Disabled card */
+.cd.disabled{opacity:.4;pointer-events:none}
+
 /* Screener list */
-.scr-item{background:var(--s2);border:1px solid var(--bdr);border-radius:var(--r);padding:14px 16px;margin-bottom:10px;display:flex;align-items:center;gap:12px;transition:border-color .2s}
+.scr-item{background:var(--s2);border:1px solid var(--bdr);border-radius:var(--r);padding:14px 16px;margin-bottom:10px;transition:border-color .2s}
 .scr-item:hover{border-color:var(--t3)}
+.scr-top{display:flex;align-items:center;gap:12px}
 .scr-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
 .scr-dot.on{background:var(--grn)}.scr-dot.off{background:var(--red)}
 .scr-info{flex:1;min-width:0}
@@ -506,6 +535,10 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--t1);min-hei
 .scr-btn:hover{border-color:var(--t3);color:var(--t1)}
 .scr-btn.del{color:var(--red);border-color:transparent}.scr-btn.del:hover{border-color:var(--red);background:var(--redg)}
 
+/* Per-screener schedule (shown in individual mode) */
+.scr-sched{margin-top:10px;padding-top:10px;border-top:1px solid var(--bdr)}
+.scr-sched .fg{margin-top:6px}
+
 /* Modal */
 .modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);display:none;z-index:50;justify-content:center;align-items:center}
 .modal-bg.show{display:flex}
@@ -515,7 +548,6 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--t1);min-hei
 .modal .f textarea{background:var(--s2);border:1px solid var(--bdr);border-radius:8px;padding:10px 12px;color:var(--t1);font-family:'Courier New',monospace;font-size:12px;outline:none;width:100%;min-height:120px;resize:vertical;transition:.2s}
 .modal .f textarea:focus{border-color:var(--acc);box-shadow:0 0 0 3px var(--accg)}
 
-/* Toast */
 .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(80px);padding:12px 24px;border-radius:var(--r);font-size:13px;font-weight:500;background:var(--s2);border:1px solid var(--bdr);color:var(--t1);box-shadow:0 8px 32px rgba(0,0,0,.4);transition:.4s cubic-bezier(.4,0,.2,1);z-index:100;white-space:nowrap}
 .toast.show{transform:translateX(-50%) translateY(0)}
 .toast.ok{border-color:var(--grn);background:linear-gradient(135deg,var(--s2),rgba(0,214,143,.08))}
@@ -533,7 +565,6 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--t1);min-hei
     <p>Cloudflare Worker • Multiple Screeners → Telegram</p>
   </div>
 
-  <!-- Status -->
   <div class="sbar">
     <div class="sdot" id="dot"></div>
     <div class="stxt" id="stxt">Loading...</div>
@@ -549,9 +580,19 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--t1);min-hei
     </div>
   </div>
 
-  <!-- Schedule -->
+  <!-- Schedule Mode Selector -->
   <div class="cd">
-    <div class="ct">Schedule (IST)</div>
+    <div class="ct">Schedule Mode</div>
+    <div class="mode-sel">
+      <button class="mode-btn" id="modeGlobal" onclick="setMode('global')">🌐 Global Schedule</button>
+      <button class="mode-btn" id="modeIndiv" onclick="setMode('individual')">🎯 Per-Screener</button>
+    </div>
+    <div class="tsub" id="modeSub" style="text-align:center"></div>
+  </div>
+
+  <!-- Global Schedule (shown when mode=global) -->
+  <div class="cd" id="globalSched">
+    <div class="ct">Global Schedule (IST)</div>
     <div class="fg">
       <div class="f"><label>Interval</label>
         <select id="intSel" onchange="saveSets()">
@@ -563,12 +604,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--t1);min-hei
       </div>
       <div class="f"><label>Last Run</label><input id="lrDisp" readonly style="color:var(--t3);cursor:default"></div>
     </div>
-  </div>
-
-  <!-- Time Window -->
-  <div class="cd">
-    <div class="ct">Active Window (IST)</div>
-    <div class="fg">
+    <div class="fg" style="margin-top:12px">
       <div class="f"><label>Start Time</label><input type="time" id="sTime" onchange="saveSets()"></div>
       <div class="f"><label>End Time</label><input type="time" id="eTime" onchange="saveSets()"></div>
     </div>
@@ -604,6 +640,28 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--t1);min-hei
     <div class="f"><label>Name</label><input id="mName" placeholder="My Screen — Description"></div>
     <div class="f"><label>Screener.in URL</label><input id="mUrl" placeholder="https://www.screener.in/screens/..."></div>
     <div class="f"><label>Query</label><textarea id="mQuery" placeholder="Is not SME AND&#10;Market Capitalization > 200 AND&#10;..."></textarea></div>
+    <div id="modalSchedSection">
+      <div class="ct" style="margin-top:16px">Individual Schedule</div>
+      <div class="fg">
+        <div class="f"><label>Interval</label>
+          <select id="mInterval">
+            <option value="1">Every 1 min</option><option value="2">Every 2 min</option>
+            <option value="3">Every 3 min</option><option value="5" selected>Every 5 min</option>
+            <option value="10">Every 10 min</option><option value="15">Every 15 min</option>
+            <option value="30">Every 30 min</option><option value="60">Every 1 hour</option>
+          </select>
+        </div>
+        <div class="f"><label>&nbsp;</label></div>
+      </div>
+      <div class="fg">
+        <div class="f"><label>Start Time</label><input type="time" id="mSTime" value="09:15"></div>
+        <div class="f"><label>End Time</label><input type="time" id="mETime" value="15:30"></div>
+      </div>
+      <div class="fg">
+        <div class="f"><label>Start Date</label><input type="date" id="mSDate"></div>
+        <div class="f"><label>End Date</label><input type="date" id="mEDate"></div>
+      </div>
+    </div>
     <div class="brow">
       <button class="btn bp" onclick="saveScr()">💾 Save</button>
       <button class="btn bs" onclick="closeModal()">Cancel</button>
@@ -615,27 +673,53 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--t1);min-hei
 
 <script>
 const A=location.origin;
-let _sets={},_scrs=[];
+let _sets={},_scrs=[],_mode='global';
+
+const INTERVAL_OPTS = {'1':'1 min','2':'2 min','3':'3 min','5':'5 min','10':'10 min','15':'15 min','30':'30 min','60':'1 hr'};
 
 async function load(){
   try{
     const[sr,sc]=await Promise.all([fetch(A+'/api/settings').then(r=>r.json()),fetch(A+'/api/screeners').then(r=>r.json())]);
-    _sets=sr;_scrs=sc;
+    _sets=sr;_scrs=sc;_mode=sr.schedule_mode||'global';
     document.getElementById('enTgl').checked=sr.enabled;
-    document.getElementById('intSel').value=String(sr.interval_minutes||1);
+    document.getElementById('intSel').value=String(sr.interval_minutes||5);
     document.getElementById('sTime').value=sr.start_time||'09:15';
     document.getElementById('eTime').value=sr.end_time||'15:30';
     document.getElementById('sDate').value=sr.start_date||'';
     document.getElementById('eDate').value=sr.end_date||'';
-    updStatus(sr);renderScrs(sc);
+    updMode();updStatus(sr);renderScrs(sc);
   }catch(e){toast('Failed to load','err')}
+}
+
+function updMode(){
+  document.getElementById('modeGlobal').className='mode-btn'+(_mode==='global'?' active':'');
+  document.getElementById('modeIndiv').className='mode-btn'+(_mode==='individual'?' active':'');
+  const gs=document.getElementById('globalSched');
+  if(_mode==='global'){
+    gs.classList.remove('disabled');
+    document.getElementById('modeSub').textContent='One schedule controls all screeners';
+  }else{
+    gs.classList.add('disabled');
+    document.getElementById('modeSub').textContent='Each screener has its own schedule';
+  }
+  renderScrs(_scrs);
+}
+
+function setMode(m){
+  _mode=m;updMode();
+  saveSets();
 }
 
 function updStatus(s){
   const d=document.getElementById('dot'),t=document.getElementById('stxt'),r=document.getElementById('sruns');
-  const enabled=_scrs.filter(x=>x.enabled!==false).length;
-  if(s.enabled){d.className='sdot on';t.innerHTML=`<b>Active</b> · ${enabled} screener(s) · ${s.start_time}–${s.end_time} IST · every ${s.interval_minutes} min`}
-  else{d.className='sdot off';t.innerHTML='<b>Paused</b> · All cron triggers skipped'}
+  const en=_scrs.filter(x=>x.enabled!==false).length;
+  if(s.enabled){
+    d.className='sdot on';
+    const modeStr=_mode==='global'?'Global':'Individual';
+    t.innerHTML=`<b>Active</b> · ${modeStr} · ${en} screener(s)`;
+  }else{
+    d.className='sdot off';t.innerHTML='<b>Paused</b> · All cron triggers skipped';
+  }
   r.innerHTML=s.total_runs?'🔢 '+s.total_runs+' runs':'';
   const lr=document.getElementById('lrDisp');
   if(s.last_run){try{lr.value=new Date(s.last_run).toLocaleString('en-IN',{timeZone:'Asia/Kolkata',hour:'2-digit',minute:'2-digit',second:'2-digit',day:'2-digit',month:'short',year:'numeric',hour12:true})}catch(e){lr.value=s.last_run}}
@@ -644,33 +728,76 @@ function updStatus(s){
 
 function renderScrs(list){
   const el=document.getElementById('scrList');
-  if(!list.length){el.innerHTML='<div style="text-align:center;padding:24px;color:var(--t3)">No screeners configured. Click + Add to get started.</div>';return}
-  el.innerHTML=list.map(s=>`
-    <div class="scr-item">
-      <div class="scr-dot ${s.enabled!==false?'on':'off'}"></div>
-      <div class="scr-info">
-        <div class="scr-name">${esc(s.name||s.id)}</div>
-        <div class="scr-url">${esc(s.url||'')}</div>
+  if(!list.length){el.innerHTML='<div style="text-align:center;padding:24px;color:var(--t3)">No screeners. Click + Add.</div>';return}
+  el.innerHTML=list.map(s=>{
+    let schedHtml='';
+    if(_mode==='individual'){
+      const iv=s.interval_minutes||5;
+      const st=s.start_time||'09:15';
+      const et=s.end_time||'15:30';
+      schedHtml=`<div class="scr-sched">
+        <div class="fg">
+          <div class="f"><label>Interval</label>
+            <select onchange="updScrSched('${s.id}','interval_minutes',parseInt(this.value))">
+              ${Object.entries(INTERVAL_OPTS).map(([v,l])=>`<option value="${v}"${parseInt(v)===iv?' selected':''}>${l}</option>`).join('')}
+            </select>
+          </div>
+          <div class="f"><label>Window</label>
+            <input type="text" value="${st} – ${et}" readonly style="color:var(--t3);cursor:default;font-size:12px">
+          </div>
+        </div>
+        <div class="fg">
+          <div class="f"><label>Start Time</label><input type="time" value="${st}" onchange="updScrSched('${s.id}','start_time',this.value)"></div>
+          <div class="f"><label>End Time</label><input type="time" value="${et}" onchange="updScrSched('${s.id}','end_time',this.value)"></div>
+        </div>
+        <div class="fg">
+          <div class="f"><label>Start Date</label><input type="date" value="${s.start_date||''}" onchange="updScrSched('${s.id}','start_date',this.value)"></div>
+          <div class="f"><label>End Date</label><input type="date" value="${s.end_date||''}" onchange="updScrSched('${s.id}','end_date',this.value)"></div>
+        </div>
+      </div>`;
+    }
+    return `<div class="scr-item">
+      <div class="scr-top">
+        <div class="scr-dot ${s.enabled!==false?'on':'off'}"></div>
+        <div class="scr-info">
+          <div class="scr-name">${esc(s.name||s.id)}</div>
+          <div class="scr-url">${esc(s.url||'')}${_mode==='individual'?' · every '+(s.interval_minutes||5)+'m':''}</div>
+        </div>
+        <div class="scr-actions">
+          <button class="scr-btn" onclick="toggleScr('${s.id}')">${s.enabled!==false?'⏸ Pause':'▶ Resume'}</button>
+          <button class="scr-btn" onclick="editScr('${s.id}')">✏️</button>
+          <button class="scr-btn del" onclick="delScr('${s.id}')">🗑</button>
+        </div>
       </div>
-      <div class="scr-actions">
-        <button class="scr-btn" onclick="toggleScr('${s.id}')">${s.enabled!==false?'⏸ Pause':'▶ Resume'}</button>
-        <button class="scr-btn" onclick="editScr('${s.id}')">✏️</button>
-        <button class="scr-btn del" onclick="delScr('${s.id}')">🗑</button>
-      </div>
-    </div>`).join('');
+      ${schedHtml}
+    </div>`;
+  }).join('');
 }
 
 let _timer;
 async function saveSets(){
   clearTimeout(_timer);_timer=setTimeout(async()=>{
     try{
-      const p={enabled:document.getElementById('enTgl').checked,interval_minutes:parseInt(document.getElementById('intSel').value),
+      const p={enabled:document.getElementById('enTgl').checked,
+        schedule_mode:_mode,
+        interval_minutes:parseInt(document.getElementById('intSel').value),
         start_time:document.getElementById('sTime').value,end_time:document.getElementById('eTime').value,
         start_date:document.getElementById('sDate').value,end_date:document.getElementById('eDate').value};
       const r=await fetch(A+'/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});
       const d=await r.json();if(d.ok){_sets=d.settings;updStatus(d.settings);toast('Settings saved ✓','ok')}
     }catch(e){toast('Save failed','err')}
   },300);
+}
+
+async function updScrSched(id,field,val){
+  const s=_scrs.find(x=>x.id===id);
+  if(!s)return;
+  s[field]=val;
+  try{
+    const r=await fetch(A+'/api/screeners',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(s)});
+    const d=await r.json();
+    if(d.ok){_scrs=d.screeners;toast('Schedule saved ✓','ok')}
+  }catch(e){toast('Failed','err')}
 }
 
 async function toggleScr(id){
@@ -689,6 +816,11 @@ function openModal(s){
   document.getElementById('mName').value=s?s.name:'';
   document.getElementById('mUrl').value=s?s.url:'';
   document.getElementById('mQuery').value=s?s.query:'';
+  document.getElementById('mInterval').value=String(s?s.interval_minutes||5:5);
+  document.getElementById('mSTime').value=s?s.start_time||'09:15':'09:15';
+  document.getElementById('mETime').value=s?s.end_time||'15:30':'15:30';
+  document.getElementById('mSDate').value=s?s.start_date||'':'';
+  document.getElementById('mEDate').value=s?s.end_date||'':'';
   document.getElementById('modalBg').classList.add('show');
 }
 function closeModal(){document.getElementById('modalBg').classList.remove('show')}
@@ -696,15 +828,22 @@ function editScr(id){const s=_scrs.find(x=>x.id===id);if(s)openModal(s)}
 
 async function saveScr(){
   const o={id:document.getElementById('mId').value.trim(),name:document.getElementById('mName').value.trim(),
-    url:document.getElementById('mUrl').value.trim(),query:document.getElementById('mQuery').value.trim(),enabled:true};
+    url:document.getElementById('mUrl').value.trim(),query:document.getElementById('mQuery').value.trim(),enabled:true,
+    interval_minutes:parseInt(document.getElementById('mInterval').value),
+    start_time:document.getElementById('mSTime').value,end_time:document.getElementById('mETime').value,
+    start_date:document.getElementById('mSDate').value,end_date:document.getElementById('mEDate').value,
+    last_run_epoch:0};
   if(!o.id||!o.url||!o.query){toast('Fill all fields','err');return}
+  // Preserve last_run_epoch if editing
+  const existing=_scrs.find(x=>x.id===o.id);
+  if(existing)o.last_run_epoch=existing.last_run_epoch||0;
   try{const r=await fetch(A+'/api/screeners',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});
   const d=await r.json();if(d.ok){_scrs=d.screeners;renderScrs(_scrs);closeModal();toast('Saved ✓','ok')}}catch(e){toast('Failed','err')}
 }
 
 async function trigNow(){
   const b=document.getElementById('trigBtn'),sp=document.getElementById('trigSp');b.disabled=true;sp.style.display='inline-block';
-  try{const r=await fetch(A+'/api/trigger',{method:'POST'});const d=await r.json();toast(`⚡ Triggered ${d.triggered} screener(s)!`,'ok');setTimeout(load,2000)}
+  try{const r=await fetch(A+'/api/trigger',{method:'POST'});const d=await r.json();toast('⚡ Triggered '+d.triggered+' screener(s)!','ok');setTimeout(load,2000)}
   catch(e){toast('Failed','err')}finally{b.disabled=false;sp.style.display='none'}
 }
 
