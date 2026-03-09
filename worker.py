@@ -155,6 +155,26 @@ class Default(WorkerEntrypoint):
             await self.env.KV.put("screeners", json.dumps(screeners))
             return self._json({"ok": True, "screeners": screeners})
 
+        # ── API: Telegram Accounts ──
+        if "/api/telegram/delete" in url and method == "POST":
+            body = json.loads(str(await request.text()))
+            del_idx = int(body.get("index", -1))
+            accts = await self._get_telegram_accounts()
+            if 0 <= del_idx < len(accts):
+                accts.pop(del_idx)
+            await self.env.KV.put("telegram_accounts", json.dumps(accts))
+            return self._json({"ok": True, "accounts": accts})
+
+        if "/api/telegram" in url and method == "GET":
+            return self._json(await self._get_telegram_accounts())
+
+        if "/api/telegram" in url and method == "POST":
+            body = json.loads(str(await request.text()))
+            accts = await self._get_telegram_accounts()
+            accts.append({"name": body.get("name", ""), "token": body.get("token", ""), "chat_id": body.get("chat_id", "")})
+            await self.env.KV.put("telegram_accounts", json.dumps(accts))
+            return self._json({"ok": True, "accounts": accts})
+
         # ── API: Manual Trigger ──
         if "/api/trigger" in url and method == "POST":
             screeners = await self._get_screeners()
@@ -278,6 +298,22 @@ class Default(WorkerEntrypoint):
         await self.env.KV.put("screeners", json.dumps(SCREENERS))
         return list(SCREENERS)
 
+    async def _get_telegram_accounts(self):
+        raw = await self.env.KV.get("telegram_accounts")
+        if raw:
+            return json.loads(str(raw))
+        # Seed with both accounts on first run
+        seed = [
+            {"name": "Account 1", "token": str(self.env.TELEGRAM_TOKEN), "chat_id": str(self.env.TELEGRAM_CHAT_ID)},
+        ]
+        await self.env.KV.put("telegram_accounts", json.dumps(seed))
+        return seed
+
+    async def _send_all(self, text):
+        accts = await self._get_telegram_accounts()
+        for a in accts:
+            await send_telegram(a["token"], a["chat_id"], text)
+
     async def _run_single(self, screener):
         sid = screener["id"]
         scr_url = screener["url"]
@@ -320,13 +356,12 @@ class Default(WorkerEntrypoint):
             curr_names = [dict(zip(headers_row, r)).get("Name", "") for r in rows]
 
             msg = format_message(scr_name, headers_row, rows, curr_names, prev_names)
-            await send_telegram(str(self.env.TELEGRAM_TOKEN), str(self.env.TELEGRAM_CHAT_ID), msg)
+            await self._send_all(msg)
 
             await self.env.KV.put(prev_key, json.dumps(curr_names))
 
         except Exception as e:
-            await send_telegram(str(self.env.TELEGRAM_TOKEN), str(self.env.TELEGRAM_CHAT_ID),
-                                f"❌ <b>[{scr_name}] Error:</b> {str(e)}")
+            await self._send_all(f"❌ <b>[{scr_name}] Error:</b> {str(e)}")
 
 
 # ─── Pure functions ───
@@ -623,6 +658,15 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--t1);min-hei
     <div id="scrList"></div>
   </div>
 
+  <!-- Telegram Accounts -->
+  <div class="cd">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <div class="ct" style="margin:0">Telegram Accounts</div>
+      <button class="btn bp btn-sm" onclick="openTgModal()">+ Add</button>
+    </div>
+    <div id="tgList"></div>
+  </div>
+
   <!-- Actions -->
   <div class="brow">
     <button class="btn bp" id="trigBtn" onclick="trigNow()">⚡ Run All Now <div class="spinner" id="trigSp"></div></button>
@@ -669,25 +713,39 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--t1);min-hei
   </div>
 </div>
 
+<!-- Telegram Modal -->
+<div class="modal-bg" id="tgModalBg" onclick="if(event.target===this)closeTgModal()">
+  <div class="modal">
+    <h2>Add Telegram Account</h2>
+    <div class="f"><label>Name (label)</label><input id="tgName" placeholder="My Account"></div>
+    <div class="f"><label>Bot Token</label><input id="tgToken" placeholder="1234567890:AABBC..."></div>
+    <div class="f"><label>Chat ID</label><input id="tgChatId" placeholder="1234567890"></div>
+    <div class="brow">
+      <button class="btn bp" onclick="saveTg()">💾 Save</button>
+      <button class="btn bs" onclick="closeTgModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
 const A=location.origin;
-let _sets={},_scrs=[],_mode='global';
+let _sets={},_scrs=[],_mode='global',_tg=[];
 
 const INTERVAL_OPTS = {'1':'1 min','2':'2 min','3':'3 min','5':'5 min','10':'10 min','15':'15 min','30':'30 min','60':'1 hr'};
 
 async function load(){
   try{
-    const[sr,sc]=await Promise.all([fetch(A+'/api/settings').then(r=>r.json()),fetch(A+'/api/screeners').then(r=>r.json())]);
-    _sets=sr;_scrs=sc;_mode=sr.schedule_mode||'global';
+    const[sr,sc,tg]=await Promise.all([fetch(A+'/api/settings').then(r=>r.json()),fetch(A+'/api/screeners').then(r=>r.json()),fetch(A+'/api/telegram').then(r=>r.json())]);
+    _sets=sr;_scrs=sc;_tg=tg;_mode=sr.schedule_mode||'global';
     document.getElementById('enTgl').checked=sr.enabled;
     document.getElementById('intSel').value=String(sr.interval_minutes||5);
     document.getElementById('sTime').value=sr.start_time||'09:15';
     document.getElementById('eTime').value=sr.end_time||'15:30';
     document.getElementById('sDate').value=sr.start_date||'';
     document.getElementById('eDate').value=sr.end_date||'';
-    updMode();updStatus(sr);renderScrs(sc);
+    updMode();updStatus(sr);renderScrs(sc);renderTg(tg);
   }catch(e){toast('Failed to load','err')}
 }
 
@@ -845,6 +903,38 @@ async function trigNow(){
   const b=document.getElementById('trigBtn'),sp=document.getElementById('trigSp');b.disabled=true;sp.style.display='inline-block';
   try{const r=await fetch(A+'/api/trigger',{method:'POST'});const d=await r.json();toast('⚡ Triggered '+d.triggered+' screener(s)!','ok');setTimeout(load,2000)}
   catch(e){toast('Failed','err')}finally{b.disabled=false;sp.style.display='none'}
+}
+
+// ── Telegram accounts ──
+function renderTg(list){
+  const el=document.getElementById('tgList');
+  if(!list.length){el.innerHTML='<div style="text-align:center;padding:24px;color:var(--t3)">No accounts. Click + Add.</div>';return}
+  el.innerHTML=list.map((a,i)=>`
+    <div class="scr-item">
+      <div class="scr-top">
+        <div class="scr-dot on"></div>
+        <div class="scr-info">
+          <div class="scr-name">📱 ${esc(a.name||'Account '+(i+1))}</div>
+          <div class="scr-url">Chat: ${esc(a.chat_id)} · Bot: ${esc(a.token.substring(0,12))}...</div>
+        </div>
+        <div class="scr-actions">
+          <button class="scr-btn del" onclick="delTg(${i})">🗑</button>
+        </div>
+      </div>
+    </div>`).join('');
+}
+function openTgModal(){document.getElementById('tgName').value='';document.getElementById('tgToken').value='';document.getElementById('tgChatId').value='';document.getElementById('tgModalBg').classList.add('show')}
+function closeTgModal(){document.getElementById('tgModalBg').classList.remove('show')}
+async function saveTg(){
+  const o={name:document.getElementById('tgName').value.trim(),token:document.getElementById('tgToken').value.trim(),chat_id:document.getElementById('tgChatId').value.trim()};
+  if(!o.token||!o.chat_id){toast('Fill token and chat ID','err');return}
+  try{const r=await fetch(A+'/api/telegram',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});
+  const d=await r.json();if(d.ok){_tg=d.accounts;renderTg(_tg);closeTgModal();toast('Account added ✓','ok')}}catch(e){toast('Failed','err')}
+}
+async function delTg(idx){
+  if(!confirm('Remove this Telegram account?'))return;
+  try{const r=await fetch(A+'/api/telegram/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx})});
+  const d=await r.json();if(d.ok){_tg=d.accounts;renderTg(_tg);toast('Removed ✓','ok')}}catch(e){toast('Failed','err')}
 }
 
 function toast(m,t){const e=document.getElementById('toast');e.textContent=m;e.className='toast '+t+' show';setTimeout(()=>e.className='toast',2500)}
