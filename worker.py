@@ -358,27 +358,63 @@ def format_message(screen_name, headers, rows, curr_names, prev_names):
         lines.append("⚠️ <b>No stocks passed filters</b>")
         return "\n".join(lines)
     lines.append(f"✅ <b>{len(rows)} stock(s) passed</b>\n")
+
+    # Columns to skip in the detail display
+    skip = {"S.No.", "Is not SME"}
+
     for row in rows:
-        d      = dict(zip(headers, row))
-        name   = d.get("Name", "?")
-        cmp    = d.get("CMP Rs.", "?")
-        pe     = d.get("P/E", "?")
-        roce   = d.get("ROCE %", "?")
-        ret1w  = d.get("1wk return %", "?")
-        ret1m  = d.get("1mth return %", "?")
-        mktcap = d.get("Mar Cap Rs.Cr.", "?")
-        np_qtr = d.get("NP Qtr Rs.Cr.", "?")
-        qpv    = d.get("Qtr Profit Var %", "?")
-        t      = name.replace(" ","").replace(".","").replace("Inds","").upper()
-        tag    = "🆕 " if name in entered else ""
-        lines.append(
-            f"{tag}🏢 <b>{name}</b>\n"
-            f"   💰 CMP: <b>₹{cmp}</b>  |  P/E: {pe}\n"
-            f"   📈 ROCE: {roce}%  |  Mkt Cap: ₹{mktcap} Cr\n"
-            f"   {sign(ret1w)} 1W: {ret1w}%  |  {sign(ret1m)} 1M: {ret1m}%\n"
-            f"   💹 NP Qtr: ₹{np_qtr} Cr  |  Profit Var: {sign(qpv)}{qpv}%\n"
-            f"   🔗 <a href='https://www.screener.in/company/{t}/'>View</a>"
-        )
+        d = dict(zip(headers, row))
+        name = d.get("Name", "?")
+        t = name.replace(" ","").replace(".","").replace("Inds","").upper()
+        tag = "🆕 " if name in entered else ""
+
+        # Header line
+        block = f"{tag}🏢 <b>{name}</b>\n"
+
+        # Show all columns as key: value pairs, 2 per line
+        items = []
+        for h in headers:
+            if h in skip or h == "Name":
+                continue
+            val = d.get(h, "")
+            if not val:
+                continue
+            # Add emoji for known fields
+            label = h
+            if "CMP" in h:
+                items.append(f"💰 CMP: <b>₹{val}</b>")
+            elif "return" in h.lower():
+                items.append(f"{sign(val)} {h.replace(' %','')}: {val}%")
+            elif "ROCE" in h:
+                items.append(f"📈 ROCE: {val}%")
+            elif "P/E" in h:
+                items.append(f"P/E: {val}")
+            elif "Mar Cap" in h:
+                items.append(f"Mkt Cap: ₹{val} Cr")
+            elif "NP Qtr" in h:
+                items.append(f"💹 NP Qtr: ₹{val} Cr")
+            elif "Profit Var" in h:
+                items.append(f"Profit Var: {sign(val)}{val}%")
+            elif "Sales Qtr" in h:
+                items.append(f"Sales Qtr: ₹{val} Cr")
+            elif "Sales Var" in h or "sales growth" in h.lower():
+                items.append(f"Sales Var: {sign(val)}{val}%")
+            elif "Div Yld" in h:
+                items.append(f"Div: {val}%")
+            elif "OPM" in h:
+                items.append(f"OPM: {val}%")
+            elif "%" in h:
+                items.append(f"{h.replace(' %','')}: {val}%")
+            else:
+                items.append(f"{h}: {val}")
+
+        # Print 2 items per line
+        for i in range(0, len(items), 2):
+            pair = items[i:i+2]
+            block += "   " + "  |  ".join(pair) + "\n"
+
+        block += f"   🔗 <a href='https://www.screener.in/company/{t}/'>View</a>"
+        lines.append(block)
         lines.append("─────────────────")
     return "\n".join(lines)
 
