@@ -359,43 +359,26 @@ def format_message(screen_name, headers, rows, curr_names, prev_names):
         return "\n".join(lines)
     lines.append(f"✅ <b>{len(rows)} stock(s) passed</b>\n")
     for row in rows:
-        d = dict(zip(headers, row))
+        d      = dict(zip(headers, row))
         name   = d.get("Name", "?")
-        cmp    = d.get("CMP Rs.", "")
-        pe     = d.get("P/E", "")
-        roce   = d.get("ROCE %", "")
-        mktcap = d.get("Mar Cap Rs.Cr.", "")
+        cmp    = d.get("CMP Rs.", "?")
+        pe     = d.get("P/E", "?")
+        roce   = d.get("ROCE %", "?")
+        ret1w  = d.get("1wk return %", "?")
+        ret1m  = d.get("1mth return %", "?")
+        mktcap = d.get("Mar Cap Rs.Cr.", "?")
+        np_qtr = d.get("NP Qtr Rs.Cr.", "?")
+        qpv    = d.get("Qtr Profit Var %", "?")
         t      = name.replace(" ","").replace(".","").replace("Inds","").upper()
         tag    = "🆕 " if name in entered else ""
-        # Build stock block — always show name + CMP
-        block = f"{tag}🏢 <b>{name}</b>\n"
-        # Row 1: CMP + P/E
-        parts1 = []
-        if cmp: parts1.append(f"💰 CMP: <b>₹{cmp}</b>")
-        if pe: parts1.append(f"P/E: {pe}")
-        if parts1: block += "   " + "  |  ".join(parts1) + "\n"
-        # Row 2: ROCE + Mkt Cap
-        parts2 = []
-        if roce: parts2.append(f"📈 ROCE: {roce}%")
-        if mktcap: parts2.append(f"Mkt Cap: ₹{mktcap} Cr")
-        if parts2: block += "   " + "  |  ".join(parts2) + "\n"
-        # Row 3: Returns (only if columns exist)
-        ret1w = d.get("1wk return %", "")
-        ret1m = d.get("1mth return %", "")
-        parts3 = []
-        if ret1w: parts3.append(f"{sign(ret1w)} 1W: {ret1w}%")
-        if ret1m: parts3.append(f"{sign(ret1m)} 1M: {ret1m}%")
-        if parts3: block += "   " + "  |  ".join(parts3) + "\n"
-        # Row 4: Quarterly data (only if columns exist)
-        np_qtr = d.get("NP Qtr Rs.Cr.", "")
-        qpv    = d.get("Qtr Profit Var %", "")
-        parts4 = []
-        if np_qtr: parts4.append(f"💹 NP Qtr: ₹{np_qtr} Cr")
-        if qpv: parts4.append(f"Profit Var: {sign(qpv)}{qpv}%")
-        if parts4: block += "   " + "  |  ".join(parts4) + "\n"
-        # Link
-        block += f"   🔗 <a href='https://www.screener.in/company/{t}/'>View</a>"
-        lines.append(block)
+        lines.append(
+            f"{tag}🏢 <b>{name}</b>\n"
+            f"   💰 CMP: <b>₹{cmp}</b>  |  P/E: {pe}\n"
+            f"   📈 ROCE: {roce}%  |  Mkt Cap: ₹{mktcap} Cr\n"
+            f"   {sign(ret1w)} 1W: {ret1w}%  |  {sign(ret1m)} 1M: {ret1m}%\n"
+            f"   💹 NP Qtr: ₹{np_qtr} Cr  |  Profit Var: {sign(qpv)}{qpv}%\n"
+            f"   🔗 <a href='https://www.screener.in/company/{t}/'>View</a>"
+        )
         lines.append("─────────────────")
     return "\n".join(lines)
 
