@@ -1,0 +1,6 @@
+name = "screener-alerts-multi-cron"
+main = "wrapper.js"
+compatibility_date = "2025-12-01"
+
+[triggers]
+crons = ["* * * * *"]  # fires every 1 minute
