@@ -185,6 +185,12 @@ class Default(WorkerEntrypoint):
                     count += 1
             return self._json({"ok": True, "triggered": count})
 
+        # ── API: Internal Cron Trigger ──
+        # The JS wrapper hits this to invoke schedule logic since Pyodide cron has a GIL bug
+        if "/api/cron" in url and method == "POST":
+            await self.scheduled(None, self.env, None) # Pass self.env and None for ctx as per scheduled signature
+            return self._json({"ok": True, "cron_processed": True})
+
         # CORS preflight
         if method == "OPTIONS":
             return Response("", headers={

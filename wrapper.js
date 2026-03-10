@@ -1,8 +1,8 @@
 export default {
     async scheduled(event, env, ctx) {
         // The cron trigger fires here in JS world, avoiding the Pyodide NoGilError.
-        // We just forward the request to the Python worker's existing manual trigger endpoint.
-        const url = "https://screener-alerts-multi.quoteviral.workers.dev/api/trigger";
+        // We forward the request to the Python worker's new internal cron endpoint
+        const url = "https://screener-alerts-multi.quoteviral.workers.dev/api/cron";
 
         const request = new Request(url, {
             method: "POST",
