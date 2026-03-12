@@ -4,7 +4,7 @@ compatibility_date = "2025-12-01"
 compatibility_flags = ["python_workers"]
 
 [triggers]
-crons = ["* * * * *"]  # every 1 minute — gated by KV settings
+# Crons moved to wrangler-cron.toml (wrapper JS) to fix Pyodide NoGilError
 
 [[kv_namespaces]]
 binding = "KV"
