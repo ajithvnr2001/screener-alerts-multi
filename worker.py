@@ -401,15 +401,23 @@ def parse_table(html):
     tbody = extract_between(html, "<tbody>", "</tbody>")
     for tr in tbody.split("<tr")[1:]:
         cells = []
+        symbol = ""
         for td in tr.split("<td")[1:]:
             inner = extract_between(td, ">", "</td>")
             if "<a" in inner:
+                # Extract symbol from /company/SYMBOL/ slug
+                href = extract_between(inner, 'href="', '"')
+                if "/company/" in href:
+                    symbol = href.split("/company/")[1].strip("/")
                 inner = extract_between(inner, ">", "</a>")
             while "<" in inner and ">" in inner:
                 inner = inner[:inner.find("<")] + inner[inner.find(">")+1:]
             cells.append(" ".join(inner.split()))
         if cells:
+            if symbol: cells.append(symbol)
             rows.append(cells)
+    if rows and len(rows[0]) > len(headers):
+        headers.append("_symbol")
     return headers, rows
 
 def extract_between(s, start, end):
@@ -481,7 +489,10 @@ def format_message(screen_name, headers, rows, curr_names, prev_names):
         for i in range(0, len(items), 2):
             pair = items[i:i+2]
             block += "   " + "  |  ".join(pair) + "\n"
-        block += f"   🔗 <a href='https://www.screener.in/company/{t}/'>View</a>"
+        
+        # Use extracted symbol if available, otherwise fallback to name-based derivation
+        symbol = d.get("_symbol", t)
+        block += f"   🔗 <a href='https://www.screener.in/company/{symbol}/'>View</a>"
         lines.append(block)
         lines.append("─────────────────")
     return "\n".join(lines)
